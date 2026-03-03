@@ -192,6 +192,8 @@ pub(super) struct OpPayloadBuilder<Pool, Client, BuilderTx> {
     pub address_gas_limiter: AddressGasLimiter,
     /// Tokio task metrics for monitoring spawned tasks
     pub task_metrics: Arc<FlashblocksTaskMetrics>,
+    /// Sidecar client for cross-chain transactions
+    pub sidecar: crate::sidecar::SidecarClient,
 }
 
 impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
@@ -209,6 +211,7 @@ impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
         task_metrics: Arc<FlashblocksTaskMetrics>,
     ) -> Self {
         let address_gas_limiter = AddressGasLimiter::new(config.gas_limiter_config.clone());
+        let sidecar = crate::sidecar::SidecarClient::new(config.specific.sidecar.clone());
         Self {
             evm_config,
             pool,
@@ -220,6 +223,7 @@ impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
             builder_tx,
             address_gas_limiter,
             task_metrics,
+            sidecar,
         }
     }
 }
@@ -744,6 +748,8 @@ where
             *footprint = footprint.saturating_sub(builder_tx_da_size.saturating_mul(scalar as u64));
         }
 
+        // Execute pool transactions first. The sidecar poll is deferred until after the pool so
+        // state_overrides sent to sidecar reflect this flashblock's pool-tx effects.
         let best_txs_start_time = Instant::now();
         best_txs.refresh_iterator(
             BestPayloadTransactions::new(
@@ -761,6 +767,7 @@ where
             .set(transaction_pool_fetch_time);
 
         let tx_execution_start_time = Instant::now();
+        let gas_before_sidecar = info.cumulative_gas_used;
         ctx.execute_best_transactions(
             info,
             state,
@@ -791,6 +798,71 @@ where
         ctx.metrics
             .payload_transaction_simulation_gauge
             .set(payload_transaction_simulation_time);
+
+        // Poll sidecar for cross-chain transactions.
+        let pool_gas_used = info.cumulative_gas_used.saturating_sub(gas_before_sidecar);
+        let state_overrides = if self.sidecar.is_enabled() {
+            let overrides = crate::sidecar::build_state_overrides(state);
+            match overrides.as_object() {
+                Some(map) if map.is_empty() => None,
+                Some(_) => Some(overrides),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let poll_request = crate::sidecar::PollRequest {
+            chain_id: ctx.chain_id(),
+            block_number: ctx.block_number(),
+            flashblock_index,
+            state_root: ctx.parent().header().state_root,
+            timestamp: ctx.timestamp(),
+            gas_limit: target_gas_for_batch.saturating_sub(pool_gas_used),
+            state_overrides,
+        };
+        let sidecar_poll = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.sidecar.poll_transactions(&poll_request))
+        });
+        match sidecar_poll {
+            Ok(Some(external_txs)) if !external_txs.is_empty() => {
+                let sidecar_tx_count = external_txs.len();
+                let sidecar_required_count = external_txs.iter().filter(|tx| tx.required).count();
+
+                if let Err(err) = ctx.execute_sidecar_transactions(
+                    info,
+                    state,
+                    external_txs,
+                    target_gas_for_batch.min(ctx.block_gas_limit()),
+                    target_da_for_batch,
+                    target_da_footprint_for_batch,
+                ) {
+                    error!(
+                        target: "payload_builder",
+                        chain_id = ctx.chain_id(),
+                        block_number = ctx.block_number(),
+                        flashblock_index,
+                        sidecar_tx_count,
+                        sidecar_required_count,
+                        err = %err,
+                        err_debug = ?err,
+                        "failed while executing sidecar transactions"
+                    );
+                    return Err(err).wrap_err("failed to execute sidecar transactions");
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    target: "payload_builder",
+                    chain_id = ctx.chain_id(),
+                    block_number = ctx.block_number(),
+                    flashblock_index,
+                    err = %err,
+                    "sidecar poll failed, continuing without external transactions"
+                );
+            }
+        }
 
         if let Err(e) = self
             .builder_tx

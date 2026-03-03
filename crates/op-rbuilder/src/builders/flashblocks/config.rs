@@ -1,6 +1,6 @@
 use alloy_primitives::Address;
 
-use crate::{args::OpRbuilderArgs, builders::BuilderConfig};
+use crate::{args::OpRbuilderArgs, builders::BuilderConfig, sidecar::SidecarConfig};
 use core::{
     net::{Ipv4Addr, SocketAddr},
     time::Duration,
@@ -70,6 +70,9 @@ pub struct FlashblocksConfig {
 
     /// Maximum number of concurrent WebSocket subscribers
     pub ws_subscriber_limit: Option<u16>,
+
+    /// Compose sidecar configuration for cross-chain transactions
+    pub sidecar: SidecarConfig,
 }
 
 impl Default for FlashblocksConfig {
@@ -91,6 +94,7 @@ impl Default for FlashblocksConfig {
             p2p_known_peers: None,
             p2p_max_peer_count: 50,
             ws_subscriber_limit: None,
+            sidecar: SidecarConfig::default(),
         }
     }
 }
@@ -133,6 +137,11 @@ impl TryFrom<OpRbuilderArgs> for FlashblocksConfig {
             p2p_known_peers: args.flashblocks.p2p.p2p_known_peers,
             p2p_max_peer_count: args.flashblocks.p2p.p2p_max_peer_count,
             ws_subscriber_limit: args.flashblocks.ws_subscriber_limit,
+            sidecar: SidecarConfig {
+                endpoint: args.flashblocks.sidecar.endpoint.unwrap_or_default(),
+                poll_timeout: Duration::from_millis(args.flashblocks.sidecar.poll_timeout_ms),
+                max_retries: args.flashblocks.sidecar.max_retries,
+            },
         })
     }
 }
